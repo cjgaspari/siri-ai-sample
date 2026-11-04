@@ -6,6 +6,7 @@ enum LarderError: Error, CustomLocalizedStringResourceConvertible {
     case recipeNotFound
     case plannedMealNotFound
     case shoppingListNotFound
+    case remindersAccessDenied
     case emptyIngredients
     case invalidCookTime
     case invalidDayCount
@@ -18,6 +19,8 @@ enum LarderError: Error, CustomLocalizedStringResourceConvertible {
             "That meal isn't on the meal plan anymore. Get the meal plan again to see what's planned."
         case .shoppingListNotFound:
             "That shopping list doesn't exist. Use Groceries or Farmers Market."
+        case .remindersAccessDenied:
+            "Larder can't reach Reminders, where shopping lists are kept. Ask the person to open Larder and allow access to Reminders, or turn it on in Settings."
         case .emptyIngredients:
             "A recipe needs at least one ingredient. Ask the person what goes in it."
         case .invalidCookTime:

@@ -195,13 +195,15 @@ struct RecipeDetailView: View {
     }
 
     private func addIngredients() {
-        do {
-            let added = try store.addItems(recipe.ingredients, toList: SeedData.defaultListID)
-            withAnimation { confirmation = "Added \(added.count) Items to Groceries" }
-            let intent = AddRecipeIngredientsIntent(recipe: RecipeEntity(recipe))
-            Task { try? await IntentDonationManager.shared.donate(intent: intent) }
-        } catch {
-            withAnimation { confirmation = error.localizedDescription }
+        Task {
+            do {
+                let added = try await store.addItems(recipe.ingredients, toList: SeedData.defaultListID)
+                withAnimation { confirmation = "Added \(added.count) Items to Groceries" }
+                let intent = AddRecipeIngredientsIntent(recipe: RecipeEntity(recipe))
+                _ = try? await IntentDonationManager.shared.donate(intent: intent)
+            } catch {
+                withAnimation { confirmation = error.localizedDescription }
+            }
         }
     }
 }

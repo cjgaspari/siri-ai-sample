@@ -62,32 +62,21 @@ final class MealPlanEntry {
     }
 }
 
-@Model
-final class ShoppingList {
-    @Attribute(.unique) var id: String
-    var name: String
-
-    init(id: String, name: String) {
-        self.id = id
-        self.name = name
-    }
+/// A list Larder shops from. The items live in the Reminders list with the same name, so the
+/// identifier stays a stable slug even though the Reminders list's own identifier can change on sync.
+struct ShoppingList: Identifiable, Hashable {
+    let id: String
+    let name: String
 }
 
-@Model
-final class ShoppingItem {
-    @Attribute(.unique) var id: String
-    var listID: String
+/// A snapshot of one reminder. EventKit objects aren't `Sendable`, so they're copied into this
+/// value right after a fetch.
+struct ShoppingItem: Identifiable, Hashable {
+    /// The reminder's `calendarItemIdentifier`.
+    let id: String
     var name: String
     var isChecked: Bool
     var createdAt: Date
-
-    init(id: String = UUID().uuidString, listID: String, name: String, isChecked: Bool = false, createdAt: Date = .now) {
-        self.id = id
-        self.listID = listID
-        self.name = name
-        self.isChecked = isChecked
-        self.createdAt = createdAt
-    }
 }
 
 @Model

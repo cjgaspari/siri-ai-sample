@@ -1,7 +1,9 @@
 import AppIntents
 import CoreSpotlight
+import EventKit
 import Foundation
 import Observation
+import OSLog
 import SwiftData
 import SwiftUI
 
@@ -29,10 +31,21 @@ final class LarderStore {
     var cooking: CookingSession?
     var isCookingPresented = false
 
+    /// Bumped after every shopping change made in this process, including ones Siri makes while the app
+    /// is running. Reminders doesn't reliably post `EKEventStoreChanged` for the app's own saves, so the
+    /// Shopping tab watches this too.
+    private(set) var shoppingRevision = 0
+
+    @ObservationIgnored private let shoppingLog = Logger(subsystem: "Larder", category: "Shopping")
+
     private var context: ModelContext { container.mainContext }
 
+    /// Shopping lists live in Reminders. One store for the app's lifetime: EventKit is slow to set up
+    /// and tear down.
+    @ObservationIgnored let eventStore = EKEventStore()
+
     init(inMemory: Bool = false) {
-        let schema = Schema([Recipe.self, MealPlanEntry.self, ShoppingList.self, ShoppingItem.self, JournalEntry.self])
+        let schema = Schema([Recipe.self, MealPlanEntry.self, JournalEntry.self])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: inMemory)
         do {
             container = try ModelContainer(for: schema, configurations: configuration)
@@ -152,42 +165,120 @@ final class LarderStore {
 
     // MARK: Shopping
 
+    var hasRemindersAccess: Bool {
+        EKEventStore.authorizationStatus(for: .reminder) == .fullAccess
+    }
+
+    /// Asks for access the first time. Siri can run an intent without showing the app, in which case
+    /// the prompt may not appear, so the error tells the person how to fix it.
+    func requestRemindersAccess() async throws {
+        switch EKEventStore.authorizationStatus(for: .reminder) {
+        case .fullAccess:
+            return
+        case .notDetermined:
+            let granted = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Bool, Error>) in
+                eventStore.requestFullAccessToReminders { granted, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: granted)
+                    }
+                }
+            }
+            guard granted else { throw LarderError.remindersAccessDenied }
+            // Anything read before access was granted is stale.
+            eventStore.reset()
+        default:
+            throw LarderError.remindersAccessDenied
+        }
+    }
+
     func allShoppingLists() -> [ShoppingList] {
-        (try? context.fetch(FetchDescriptor<ShoppingList>(sortBy: [SortDescriptor(\.name)]))) ?? []
+        SeedData.shoppingLists()
     }
 
     func shoppingList(id: String) -> ShoppingList? {
-        var descriptor = FetchDescriptor<ShoppingList>(predicate: #Predicate { $0.id == id })
-        descriptor.fetchLimit = 1
-        return try? context.fetch(descriptor).first
+        allShoppingLists().first { $0.id == id }
     }
 
-    func items(inList listID: String) -> [ShoppingItem] {
-        let descriptor = FetchDescriptor<ShoppingItem>(
-            predicate: #Predicate { $0.listID == listID },
-            sortBy: [SortDescriptor(\.createdAt)]
-        )
-        return (try? context.fetch(descriptor)) ?? []
+    /// The Reminders list with the same name, matched case-insensitively so an existing Groceries list
+    /// is reused.
+    private func reminderList(for list: ShoppingList) -> EKCalendar? {
+        eventStore.calendars(for: .reminder).first { $0.title.localizedCaseInsensitiveCompare(list.name) == .orderedSame }
+    }
+
+    private func reminderListCreatingIfNeeded(for list: ShoppingList) throws -> EKCalendar {
+        if let existing = reminderList(for: list) { return existing }
+        let calendar = EKCalendar(for: .reminder, eventStore: eventStore)
+        calendar.title = list.name
+        guard let source = eventStore.defaultCalendarForNewReminders()?.source else {
+            throw LarderError.remindersAccessDenied
+        }
+        calendar.source = source
+        try eventStore.saveCalendar(calendar, commit: true)
+        return calendar
+    }
+
+    func items(inList listID: String) async throws -> [ShoppingItem] {
+        guard let list = shoppingList(id: listID) else { throw LarderError.shoppingListNotFound }
+        try await requestRemindersAccess()
+        // A list that doesn't exist in Reminders yet is just empty.
+        guard let calendar = reminderList(for: list) else { return [] }
+        let predicate = eventStore.predicateForReminders(in: [calendar])
+        return await withCheckedContinuation { continuation in
+            // EventKit calls back on its own queue, so the closure is `@Sendable` rather than main-actor
+            // isolated, and copies each reminder into a value before handing it back.
+            _ = eventStore.fetchReminders(matching: predicate) { @Sendable reminders in
+                let items = (reminders ?? []).map { reminder in
+                    ShoppingItem(
+                        id: reminder.calendarItemIdentifier,
+                        name: reminder.title ?? "",
+                        isChecked: reminder.isCompleted,
+                        createdAt: reminder.creationDate ?? .distantPast
+                    )
+                }
+                continuation.resume(returning: items.sorted { $0.createdAt < $1.createdAt })
+            }
+        }
     }
 
     /// Adds only what isn't already on the list unchecked, and returns the names it added.
     @discardableResult
-    func addItems(_ names: [String], toList listID: String) throws -> [String] {
-        guard shoppingList(id: listID) != nil else { throw LarderError.shoppingListNotFound }
-        let existing = Set(items(inList: listID).filter { !$0.isChecked }.map { $0.name.lowercased() })
+    func addItems(_ names: [String], toList listID: String) async throws -> [String] {
+        guard let list = shoppingList(id: listID) else { throw LarderError.shoppingListNotFound }
+        let existing = Set(try await items(inList: listID).filter { !$0.isChecked }.map { $0.name.lowercased() })
         let added = names.filter { !existing.contains($0.lowercased()) }
-        for (offset, name) in added.enumerated() {
-            let createdAt = Date.now.addingTimeInterval(Double(offset) / 1000)
-            context.insert(ShoppingItem(listID: listID, name: name, createdAt: createdAt))
+        shoppingLog.info("Asked to add \(names, privacy: .public) to \(listID, privacy: .public); \(names.count - added.count) already on it")
+        guard !added.isEmpty else { return [] }
+        let calendar = try reminderListCreatingIfNeeded(for: list)
+        for name in added {
+            let reminder = EKReminder(eventStore: eventStore)
+            reminder.title = name
+            reminder.calendar = calendar
+            try eventStore.save(reminder, commit: false)
         }
-        try context.save()
+        try eventStore.commit()
+        shoppingRevision += 1
+        shoppingLog.info("Added \(added, privacy: .public) to \(calendar.title, privacy: .public) (\(calendar.calendarIdentifier, privacy: .public))")
         return added
     }
 
-    func clearList(id listID: String) throws {
-        guard shoppingList(id: listID) != nil else { throw LarderError.shoppingListNotFound }
-        items(inList: listID).forEach(context.delete)
-        try context.save()
+    func setChecked(_ isChecked: Bool, itemID: String) throws {
+        guard let reminder = eventStore.calendarItem(withIdentifier: itemID) as? EKReminder else { return }
+        reminder.isCompleted = isChecked
+        try eventStore.save(reminder, commit: true)
+        shoppingRevision += 1
+    }
+
+    func clearList(id listID: String) async throws {
+        let ids = try await items(inList: listID).map(\.id)
+        for id in ids {
+            if let reminder = eventStore.calendarItem(withIdentifier: id) as? EKReminder {
+                try eventStore.remove(reminder, commit: false)
+            }
+        }
+        try eventStore.commit()
+        shoppingRevision += 1
     }
 
     // MARK: Journal
@@ -256,18 +347,21 @@ final class LarderStore {
 
     private func insertSeed() {
         SeedData.recipes().forEach(context.insert)
-        SeedData.shoppingLists().forEach(context.insert)
         try? context.save()
     }
 
     func resetDemoData() async throws {
         try context.delete(model: Recipe.self)
         try context.delete(model: MealPlanEntry.self)
-        try context.delete(model: ShoppingList.self)
-        try context.delete(model: ShoppingItem.self)
         try context.delete(model: JournalEntry.self)
         try context.save()
         insertSeed()
+        // Empties Larder's lists in Reminders too. This only runs from the debug-only test fixture.
+        if hasRemindersAccess {
+            for list in allShoppingLists() where reminderList(for: list) != nil {
+                try await clearList(id: list.id)
+            }
+        }
         homePath = NavigationPath()
         stopCooking()
         try await CSSearchableIndex.default().deleteAppEntities(ofType: RecipeEntity.self)

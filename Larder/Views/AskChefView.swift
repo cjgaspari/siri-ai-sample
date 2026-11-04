@@ -47,7 +47,7 @@ private struct AskChefConversation: View {
                 }
                 if !chat.proposedItems.isEmpty, !chat.isResponding {
                     Button("Add \(chat.proposedItems.joined(separator: ", ")) to Groceries", systemImage: "cart.badge.plus") {
-                        chat.addProposedItems()
+                        Task { await chat.addProposedItems() }
                     }
                     .buttonStyle(.glassProminent)
                     .tint(.white)

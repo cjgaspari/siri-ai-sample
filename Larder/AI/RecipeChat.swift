@@ -63,9 +63,9 @@ final class RecipeChat {
         proposedItems = items
     }
 
-    func addProposedItems() {
+    func addProposedItems() async {
         do {
-            let added = try store.addItems(proposedItems, toList: SeedData.defaultListID)
+            let added = try await store.addItems(proposedItems, toList: SeedData.defaultListID)
             addedMessage = added.isEmpty ? "Already on Groceries." : "Added \(added.count) to Groceries."
             proposedItems = []
         } catch {

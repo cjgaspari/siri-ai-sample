@@ -27,12 +27,13 @@ struct AddRecipeIngredientsIntent {
     @MainActor
     func perform() async throws -> some ReturnsValue<ShoppingListEntity> & ProvidesDialog {
         let listID = list?.id ?? SeedData.defaultListID
-        let added = try store.addItems(recipe.ingredients, toList: listID)
-        guard let updated = store.shoppingList(id: listID) else { throw LarderError.shoppingListNotFound }
-        return .result(
-            value: ShoppingListEntity(updated, store: store),
-            dialog: "Added \(added.count) items for \(recipe.name) to \(updated.name)."
-        )
+        let added = try await store.addItems(recipe.ingredients, toList: listID)
+        let updated = try await store.shoppingListEntity(id: listID)
+        // Says so when nothing changed, so Siri doesn't report items as added.
+        let dialog: IntentDialog = added.isEmpty
+            ? "Everything for \(recipe.name) is already on \(updated.name)."
+            : "Added \(added.count) items for \(recipe.name) to \(updated.name)."
+        return .result(value: updated, dialog: dialog)
     }
 }
 
@@ -55,12 +56,12 @@ struct AddItemToShoppingListIntent {
     @MainActor
     func perform() async throws -> some ReturnsValue<ShoppingListEntity> & ProvidesDialog {
         let listID = list?.id ?? SeedData.defaultListID
-        try store.addItems([item], toList: listID)
-        guard let updated = store.shoppingList(id: listID) else { throw LarderError.shoppingListNotFound }
-        return .result(
-            value: ShoppingListEntity(updated, store: store),
-            dialog: "Added \(item) to \(updated.name)."
-        )
+        let added = try await store.addItems([item], toList: listID)
+        let updated = try await store.shoppingListEntity(id: listID)
+        let dialog: IntentDialog = added.isEmpty
+            ? "\(item) is already on \(updated.name)."
+            : "Added \(item) to \(updated.name)."
+        return .result(value: updated, dialog: dialog)
     }
 }
 
@@ -80,8 +81,7 @@ struct GetShoppingListIntent {
     @MainActor
     func perform() async throws -> some ReturnsValue<ShoppingListEntity> & ProvidesDialog {
         let listID = list?.id ?? SeedData.defaultListID
-        guard let current = store.shoppingList(id: listID) else { throw LarderError.shoppingListNotFound }
-        let entity = ShoppingListEntity(current, store: store)
+        let entity = try await store.shoppingListEntity(id: listID)
         return .result(value: entity, dialog: "\(entity.name) has \(entity.remainingItems.count) items to buy.")
     }
 }
@@ -101,7 +101,7 @@ struct ClearShoppingListIntent {
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
         try await requestConfirmation(dialog: "Delete everything on \(list.name)? This can't be undone.")
-        try store.clearList(id: list.id)
+        try await store.clearList(id: list.id)
         return .result(dialog: "\(list.name) is empty.")
     }
 }
